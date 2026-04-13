@@ -38,6 +38,7 @@ hybrid_image = (
     .pip_install(_conv1d_whl)
     .pip_install(_mamba_whl)
     .add_local_file("train_gpt_hybrid.py", "/app/train_gpt_hybrid.py")
+    .add_local_file("train_nemotron_hybrid.py", "/app/train_nemotron_hybrid.py")
     .add_local_dir("data", "/app/data", ignore=["datasets", "tokenizers"])
 )
 
@@ -179,6 +180,50 @@ def train_hybrid_smoke():
     }, script="train_gpt_hybrid.py")
 
 
+@app.function(
+    image=hybrid_image,
+    gpu="H100",
+    timeout=1800,
+    volumes={"/vol": data_vol},
+)
+def train_nemotron_smoke():
+    """1xH100, 200 steps, Nemotron-H inspired Mamba-3 hybrid"""
+    _ensure_data("sp1024", train_shards=1)
+    return _run_training(1, {
+        "RUN_ID": "nemotron_smoke",
+        "ITERATIONS": "200",
+        "TRAIN_BATCH_TOKENS": "524288",
+        "VAL_LOSS_EVERY": "0",
+        "MAX_WALLCLOCK_SECONDS": "0",
+        "NUM_LAYERS": "8",
+        "NUM_ATTN_LAYERS": "1",
+        "ATTN_PLACEMENT": "even",
+        "MAMBA3_D_STATE": "64",
+    }, script="train_nemotron_hybrid.py")
+
+
+@app.function(
+    image=hybrid_image,
+    gpu="H100",
+    timeout=3600,
+    volumes={"/vol": data_vol},
+)
+def train_nemotron_medium():
+    """1xH100, 2000 steps, Nemotron-H Mamba-3 hybrid"""
+    _ensure_data("sp1024", train_shards=10)
+    return _run_training(1, {
+        "RUN_ID": "nemotron_medium",
+        "ITERATIONS": "2000",
+        "TRAIN_BATCH_TOKENS": "524288",
+        "VAL_LOSS_EVERY": "500",
+        "MAX_WALLCLOCK_SECONDS": "0",
+        "NUM_LAYERS": "8",
+        "NUM_ATTN_LAYERS": "1",
+        "ATTN_PLACEMENT": "even",
+        "MAMBA3_D_STATE": "64",
+    }, script="train_nemotron_hybrid.py")
+
+
 @app.local_entrypoint()
 def main(mode: str = "smoke"):
     if mode == "smoke":
@@ -189,5 +234,9 @@ def main(mode: str = "smoke"):
         result = train_full.remote()
     elif mode == "hybrid":
         result = train_hybrid_smoke.remote()
+    elif mode == "nemotron":
+        result = train_nemotron_smoke.remote()
+    elif mode == "nemotron-medium":
+        result = train_nemotron_medium.remote()
     else:
-        raise ValueError(f"Unknown mode: {mode}. Use smoke/medium/full/hybrid")
+        raise ValueError(f"Unknown mode: {mode}. Use smoke/medium/full/hybrid/nemotron/nemotron-medium")
