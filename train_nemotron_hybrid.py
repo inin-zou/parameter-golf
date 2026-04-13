@@ -116,6 +116,7 @@ class Hyperparameters:
     mamba3_chunk_size = int(os.environ.get("MAMBA3_CHUNK_SIZE", 64))
     # Attention layers (evenly spaced among SSD layers).
     num_attn_layers = int(os.environ.get("NUM_ATTN_LAYERS", 1))
+    attn_placement = os.environ.get("ATTN_PLACEMENT", "even")
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -1119,12 +1120,28 @@ class GPT(nn.Module):
             torch.ones(1, self.num_skip_weights, model_dim, dtype=torch.float32)
         )
 
-        # Compute evenly spaced attention layer indices
+        # Compute attention layer indices based on placement strategy
+        attn_placement = os.environ.get("ATTN_PLACEMENT", "even")
         attn_indices = set()
         if num_attn_layers > 0:
-            for i in range(1, num_attn_layers + 1):
-                attn_indices.add(round(i * num_layers / (num_attn_layers + 1)))
+            if attn_placement == "even":
+                for i in range(1, num_attn_layers + 1):
+                    attn_indices.add(round(i * num_layers / (num_attn_layers + 1)))
+            elif attn_placement == "first":
+                attn_indices = set(range(num_attn_layers))
+            elif attn_placement == "last":
+                attn_indices = set(range(num_layers - num_attn_layers, num_layers))
+            elif attn_placement == "nemotron":
+                for i in range(1, num_attn_layers + 1):
+                    idx = round(i * num_layers / (num_attn_layers + 1))
+                    if idx == 0:
+                        idx = 1
+                    attn_indices.add(idx)
+            else:
+                attn_indices = {int(x.strip()) for x in attn_placement.split(",")}
         self.attn_indices = sorted(attn_indices)
+        if int(os.environ.get("RANK", 0)) == 0:
+            print(f"attn_placement:{attn_placement} attn_indices:{self.attn_indices}")
 
         self.blocks = nn.ModuleList()
         for i in range(num_layers):
