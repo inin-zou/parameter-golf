@@ -130,6 +130,7 @@ class Hyperparameters:
     recur_layers_str = os.environ.get("RECUR_LAYERS", "")
     recur_mode = os.environ.get("RECUR_MODE", "block")  # "block" or "untie_mlp"
     recur_start_frac = float(os.environ.get("RECUR_START_FRAC", 0.35))
+    recur_repeats = int(os.environ.get("RECUR_REPEATS", 1))  # how many times to repeat (1=double, 2=triple)
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "0")))
     ve_dim = int(os.environ.get("VE_DIM", 64))
@@ -1271,13 +1272,13 @@ class GPT(nn.Module):
 
     def _build_layer_schedule(self) -> list[int]:
         """Build the virtual layer schedule. Without recurrence, it's [0,1,...,N-1].
-        With recurrence, the recur_layers are repeated once after their first pass."""
+        With recurrence, the recur_layers are repeated recur_repeats times."""
         num_layers = len(self.blocks)
         schedule = list(range(num_layers))
         if self.recur_enabled and self.recur_layers:
-            # Insert repeated layers right after the last recur layer
             insert_pos = max(self.recur_layers) + 1
-            schedule = schedule[:insert_pos] + self.recur_layers + schedule[insert_pos:]
+            repeats = int(os.environ.get("RECUR_REPEATS", 1))
+            schedule = schedule[:insert_pos] + self.recur_layers * repeats + schedule[insert_pos:]
         return schedule
 
     def _run_blocks(self, x: Tensor, x0: Tensor, input_ids: Tensor | None = None) -> Tensor:

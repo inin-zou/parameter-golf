@@ -315,6 +315,78 @@ def train_recur_deep():
     }, script="train_nemotron_hybrid.py")
 
 
+# --- Hinge point ablations ---
+
+@app.function(image=hybrid_image, gpu="H100", timeout=3600, volumes={"/vol": data_vol})
+def train_hinge_dual_attn():
+    """Hinge test 1: 2 Attention layers at hinge (layers 3,4), recur 2,3,4"""
+    _ensure_data("sp1024", train_shards=10)
+    return _run_training(1, {
+        "RUN_ID": "hinge_dual_attn",
+        "ITERATIONS": "2000",
+        "TRAIN_BATCH_TOKENS": "524288",
+        "VAL_LOSS_EVERY": "500",
+        "MAX_WALLCLOCK_SECONDS": "0",
+        "NUM_LAYERS": "8",
+        "NUM_ATTN_LAYERS": "2",
+        "ATTN_PLACEMENT": "3,4",
+        "MAMBA3_D_STATE": "64",
+        "RECUR_LAYERS": "2,3,4",
+        "RECUR_MODE": "block",
+        "RECUR_START_FRAC": "0.35",
+        "EVAL_STRIDE": "0",
+        "TTT_ENABLED": "0",
+        "SWEEP_MODE": "1",
+    }, script="train_nemotron_hybrid.py")
+
+
+@app.function(image=hybrid_image, gpu="H100", timeout=3600, volumes={"/vol": data_vol})
+def train_hinge_multi_recur():
+    """Hinge test 3: recur hinge (3,4) twice = 12 virtual layers"""
+    _ensure_data("sp1024", train_shards=10)
+    return _run_training(1, {
+        "RUN_ID": "hinge_multi_recur",
+        "ITERATIONS": "2000",
+        "TRAIN_BATCH_TOKENS": "524288",
+        "VAL_LOSS_EVERY": "500",
+        "MAX_WALLCLOCK_SECONDS": "0",
+        "NUM_LAYERS": "8",
+        "NUM_ATTN_LAYERS": "1",
+        "ATTN_PLACEMENT": "even",
+        "MAMBA3_D_STATE": "64",
+        "RECUR_LAYERS": "3,4",
+        "RECUR_MODE": "block",
+        "RECUR_REPEATS": "2",
+        "RECUR_START_FRAC": "0.35",
+        "EVAL_STRIDE": "0",
+        "TTT_ENABLED": "0",
+        "SWEEP_MODE": "1",
+    }, script="train_nemotron_hybrid.py")
+
+
+@app.function(image=hybrid_image, gpu="H100", timeout=3600, volumes={"/vol": data_vol})
+def train_hinge_4layer():
+    """Hinge test bonus: 4-layer recurrence (2,3,4,5)"""
+    _ensure_data("sp1024", train_shards=10)
+    return _run_training(1, {
+        "RUN_ID": "hinge_4layer",
+        "ITERATIONS": "2000",
+        "TRAIN_BATCH_TOKENS": "524288",
+        "VAL_LOSS_EVERY": "500",
+        "MAX_WALLCLOCK_SECONDS": "0",
+        "NUM_LAYERS": "8",
+        "NUM_ATTN_LAYERS": "1",
+        "ATTN_PLACEMENT": "even",
+        "MAMBA3_D_STATE": "64",
+        "RECUR_LAYERS": "2,3,4,5",
+        "RECUR_MODE": "block",
+        "RECUR_START_FRAC": "0.35",
+        "EVAL_STRIDE": "0",
+        "TTT_ENABLED": "0",
+        "SWEEP_MODE": "1",
+    }, script="train_nemotron_hybrid.py")
+
+
 @app.function(
     image=hybrid_image,
     gpu="H100",  # need H100 for Triton kernels (sm_90)
@@ -380,6 +452,18 @@ def main(mode: str = "smoke"):
         print("=== Ablation B (untie MLP) done ===")
         r3 = h3.get()
         print("=== Ablation C (3-layer deep) done ===")
+    elif mode == "hinge-ablation":
+        # Run 3 hinge point experiments in parallel
+        print("Launching 3 hinge ablations in parallel...")
+        h1 = train_hinge_dual_attn.spawn()
+        h2 = train_hinge_multi_recur.spawn()
+        h3 = train_hinge_4layer.spawn()
+        r1 = h1.get()
+        print("=== Hinge 1 (dual attn) done ===")
+        r2 = h2.get()
+        print("=== Hinge 3 (multi recur) done ===")
+        r3 = h3.get()
+        print("=== Hinge bonus (4-layer) done ===")
     elif mode == "recur-block":
         result = train_recur_block.remote()
     elif mode == "recur-untie":
