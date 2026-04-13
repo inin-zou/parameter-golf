@@ -31,9 +31,12 @@ Based on PR #1355 (best SSM submission, 1.1526 bpb).
 | Config | Steps | val_bpb | ms/step | GPU |
 |--------|-------|---------|---------|-----|
 | Baseline (pure Transformer) | 200 | 2.02 | 333 | 1xH100 |
-| Nemotron Hybrid (7 Mamba3 + 1 Attn) | 200 | 2.09 | 524 | 1xH100 |
-| **Nemotron Hybrid** | **2000** | **1.292** | **470** | **1xH100** |
+| Nemotron Hybrid (7 Mamba3 + 1 Attn) | 2000 | 1.292 | 470 | 1xH100 |
+| + depth recur 2,3,4 ×1 (11 virtual) | 2000 | 1.283 | 584 | 1xH100 |
+| **+ depth recur 3,4 ×2 (12 virtual)** | **2000** | **1.282** | **618** | **1xH100** |
 | Baseline full (8xH100, 13780 steps) | 13780 | 1.224 | 43 | 8xH100 |
+
+Best config so far: `RECUR_LAYERS=3,4 RECUR_REPEATS=2` (hinge point ×2 recurrence)
 
 2000-step result (1.292) is within 0.067 of baseline with only 1/7 the steps. Still improving.
 
