@@ -1261,7 +1261,13 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self._embed(input_ids)
         x = self._run_blocks(x, x, input_ids)
-        return self._compute_logits_and_loss(x, target_ids)
+        loss = self._compute_logits_and_loss(x, target_ids)
+        # DDP fix: ensure recur_mlps participate in the computation graph even before
+        # recurrence is enabled, so DDP doesn't complain about unused parameters.
+        if hasattr(self, 'recur_mlps') and not self.recur_enabled:
+            dummy = sum(p.sum() * 0.0 for mlp in self.recur_mlps.values() for p in mlp.parameters())
+            loss = loss + dummy
+        return loss
 
     def _build_layer_schedule(self) -> list[int]:
         """Build the virtual layer schedule. Without recurrence, it's [0,1,...,N-1].
