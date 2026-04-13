@@ -446,24 +446,24 @@ def main(mode: str = "smoke"):
         h1 = train_recur_block.spawn()
         h2 = train_recur_untie.spawn()
         h3 = train_recur_deep.spawn()
-        r1 = h1.get()
-        print("=== Ablation A (block recurrence) done ===")
-        r2 = h2.get()
-        print("=== Ablation B (untie MLP) done ===")
-        r3 = h3.get()
-        print("=== Ablation C (3-layer deep) done ===")
+        for name, handle in [("Ablation A (block)", h1), ("Ablation B (untie MLP)", h2), ("Ablation C (3-layer deep)", h3)]:
+            try:
+                handle.get()
+                print(f"=== {name} DONE ===")
+            except Exception as e:
+                print(f"=== {name} FAILED: {e} ===")
     elif mode == "hinge-ablation":
         # Run 3 hinge point experiments in parallel
         print("Launching 3 hinge ablations in parallel...")
         h1 = train_hinge_dual_attn.spawn()
         h2 = train_hinge_multi_recur.spawn()
         h3 = train_hinge_4layer.spawn()
-        r1 = h1.get()
-        print("=== Hinge 1 (dual attn) done ===")
-        r2 = h2.get()
-        print("=== Hinge 3 (multi recur) done ===")
-        r3 = h3.get()
-        print("=== Hinge bonus (4-layer) done ===")
+        for name, handle in [("Hinge 1 (dual attn)", h1), ("Hinge 3 (multi recur)", h2), ("Hinge bonus (4-layer)", h3)]:
+            try:
+                handle.get()
+                print(f"=== {name} DONE ===")
+            except Exception as e:
+                print(f"=== {name} FAILED: {e} ===")
     elif mode == "recur-block":
         result = train_recur_block.remote()
     elif mode == "recur-untie":
