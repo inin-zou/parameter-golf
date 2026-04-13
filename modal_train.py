@@ -246,6 +246,75 @@ def train_nemotron_medium():
     }, script="train_nemotron_hybrid.py")
 
 
+@app.function(image=hybrid_image, gpu="H100", timeout=3600, volumes={"/vol": data_vol})
+def train_recur_block():
+    """Ablation A: depth recurrence on entire blocks (layers 2,3)"""
+    _ensure_data("sp1024", train_shards=10)
+    return _run_training(1, {
+        "RUN_ID": "recur_block",
+        "ITERATIONS": "2000",
+        "TRAIN_BATCH_TOKENS": "524288",
+        "VAL_LOSS_EVERY": "500",
+        "MAX_WALLCLOCK_SECONDS": "0",
+        "NUM_LAYERS": "8",
+        "NUM_ATTN_LAYERS": "1",
+        "ATTN_PLACEMENT": "even",
+        "MAMBA3_D_STATE": "64",
+        "RECUR_LAYERS": "2,3",
+        "RECUR_MODE": "block",
+        "RECUR_START_FRAC": "0.35",
+        "EVAL_STRIDE": "0",
+        "TTT_ENABLED": "0",
+        "SWEEP_MODE": "1",
+    }, script="train_nemotron_hybrid.py")
+
+
+@app.function(image=hybrid_image, gpu="H100", timeout=3600, volumes={"/vol": data_vol})
+def train_recur_untie():
+    """Ablation B: depth recurrence with untied MLPs (layers 2,3)"""
+    _ensure_data("sp1024", train_shards=10)
+    return _run_training(1, {
+        "RUN_ID": "recur_untie_mlp",
+        "ITERATIONS": "2000",
+        "TRAIN_BATCH_TOKENS": "524288",
+        "VAL_LOSS_EVERY": "500",
+        "MAX_WALLCLOCK_SECONDS": "0",
+        "NUM_LAYERS": "8",
+        "NUM_ATTN_LAYERS": "1",
+        "ATTN_PLACEMENT": "even",
+        "MAMBA3_D_STATE": "64",
+        "RECUR_LAYERS": "2,3",
+        "RECUR_MODE": "untie_mlp",
+        "RECUR_START_FRAC": "0.35",
+        "EVAL_STRIDE": "0",
+        "TTT_ENABLED": "0",
+        "SWEEP_MODE": "1",
+    }, script="train_nemotron_hybrid.py")
+
+
+@app.function(image=hybrid_image, gpu="H100", timeout=3600, volumes={"/vol": data_vol})
+def train_recur_deep():
+    """Ablation C: depth recurrence on 3 layers (2,3,4) — more aggressive"""
+    _ensure_data("sp1024", train_shards=10)
+    return _run_training(1, {
+        "RUN_ID": "recur_deep",
+        "ITERATIONS": "2000",
+        "TRAIN_BATCH_TOKENS": "524288",
+        "VAL_LOSS_EVERY": "500",
+        "MAX_WALLCLOCK_SECONDS": "0",
+        "NUM_LAYERS": "8",
+        "NUM_ATTN_LAYERS": "1",
+        "ATTN_PLACEMENT": "even",
+        "MAMBA3_D_STATE": "64",
+        "RECUR_LAYERS": "2,3,4",
+        "RECUR_MODE": "block",
+        "RECUR_START_FRAC": "0.35",
+        "EVAL_STRIDE": "0",
+        "TTT_ENABLED": "0",
+        "SWEEP_MODE": "1",
+    }, script="train_nemotron_hybrid.py")
+
+
 @app.function(
     image=hybrid_image,
     gpu="H100",  # need H100 for Triton kernels (sm_90)
@@ -299,5 +368,23 @@ def main(mode: str = "smoke"):
     elif mode == "test":
         result = test_mamba3_import.remote()
         print(result)
+    elif mode == "recur-ablation":
+        # Run all 3 recurrence ablations in parallel!
+        print("Launching 3 recurrence ablations in parallel...")
+        h1 = train_recur_block.spawn()
+        h2 = train_recur_untie.spawn()
+        h3 = train_recur_deep.spawn()
+        r1 = h1.get()
+        print("=== Ablation A (block recurrence) done ===")
+        r2 = h2.get()
+        print("=== Ablation B (untie MLP) done ===")
+        r3 = h3.get()
+        print("=== Ablation C (3-layer deep) done ===")
+    elif mode == "recur-block":
+        result = train_recur_block.remote()
+    elif mode == "recur-untie":
+        result = train_recur_untie.remote()
+    elif mode == "recur-deep":
+        result = train_recur_deep.remote()
     else:
-        raise ValueError(f"Unknown mode: {mode}. Use smoke/medium/full/hybrid/nemotron/nemotron-medium/test")
+        raise ValueError(f"Unknown mode: {mode}. Use smoke/medium/full/hybrid/nemotron/nemotron-medium/test/recur-ablation/recur-block/recur-untie/recur-deep")

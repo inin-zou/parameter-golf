@@ -122,6 +122,14 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     rope_fraction = float(os.environ.get("ROPE_FRACTION", 1.0))  # partial RoPE: 0.5 = half dims
+
+    # Depth recurrence: reuse specified layers to create virtual depth without extra params
+    # RECUR_LAYERS: comma-separated physical layer indices to repeat, e.g. "2,3"
+    # RECUR_MODE: "block" = repeat entire block, "untie_mlp" = share SSM/Attn but separate MLPs
+    # RECUR_START_FRAC: fraction of training before enabling recurrence (0.35 = after 35%)
+    recur_layers_str = os.environ.get("RECUR_LAYERS", "")
+    recur_mode = os.environ.get("RECUR_MODE", "block")  # "block" or "untie_mlp"
+    recur_start_frac = float(os.environ.get("RECUR_START_FRAC", 0.35))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "0")))
     ve_dim = int(os.environ.get("VE_DIM", 64))
@@ -1187,6 +1195,23 @@ class GPT(nn.Module):
             self.ve_shared = None
             self.ve_layer_scales = nn.ParameterList()
 
+        # Depth recurrence config
+        recur_layers_str = os.environ.get("RECUR_LAYERS", "")
+        self.recur_layers = sorted(int(x) for x in recur_layers_str.split(",") if x.strip()) if recur_layers_str.strip() else []
+        self.recur_mode = os.environ.get("RECUR_MODE", "block")
+        self.recur_enabled = False  # toggled during training based on recur_start_frac
+
+        # For "untie_mlp" mode: create separate MLPs for the repeated pass
+        if self.recur_mode == "untie_mlp" and self.recur_layers:
+            self.recur_mlps = nn.ModuleDict()
+            for li in self.recur_layers:
+                orig_mlp = self.blocks[li].mlp
+                new_mlp = MLP(model_dim, mlp_mult)
+                self.recur_mlps[str(li)] = new_mlp
+
+        if self.recur_layers and int(os.environ.get("RANK", 0)) == 0:
+            print(f"depth_recurrence: layers={self.recur_layers} mode={self.recur_mode}")
+
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -1238,17 +1263,68 @@ class GPT(nn.Module):
         x = self._run_blocks(x, x, input_ids)
         return self._compute_logits_and_loss(x, target_ids)
 
+    def _build_layer_schedule(self) -> list[int]:
+        """Build the virtual layer schedule. Without recurrence, it's [0,1,...,N-1].
+        With recurrence, the recur_layers are repeated once after their first pass."""
+        num_layers = len(self.blocks)
+        schedule = list(range(num_layers))
+        if self.recur_enabled and self.recur_layers:
+            # Insert repeated layers right after the last recur layer
+            insert_pos = max(self.recur_layers) + 1
+            schedule = schedule[:insert_pos] + self.recur_layers + schedule[insert_pos:]
+        return schedule
+
     def _run_blocks(self, x: Tensor, x0: Tensor, input_ids: Tensor | None = None) -> Tensor:
         ve_cache = self.ve_shared(input_ids) if (self.ve_shared is not None and input_ids is not None) else None
+        schedule = self._build_layer_schedule()
+        num_physical = len(self.blocks)
+
+        # Split schedule into encoder (first half) and decoder (second half)
+        mid = len(schedule) // 2
+        encoder_schedule = schedule[:mid]
+        decoder_schedule = schedule[mid:]
+
         skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0, v_embed=self._get_ve(i, ve_cache))
+        recur_pass_count: dict[int, int] = {}  # track how many times each layer has been run
+
+        for vi, bi in enumerate(encoder_schedule):
+            recur_pass_count[bi] = recur_pass_count.get(bi, 0) + 1
+            is_repeat = recur_pass_count[bi] > 1
+
+            if is_repeat and self.recur_mode == "untie_mlp" and str(bi) in getattr(self, 'recur_mlps', {}):
+                # Run block with separate MLP for repeated pass
+                block = self.blocks[bi]
+                mix = block.resid_mix.to(dtype=x.dtype)
+                x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+                m3_out = block.mamba3(block.m3_norm(x)) if hasattr(block, 'mamba3') else block.attn(block.attn_norm(x))
+                scale_name = 'm3_scale' if hasattr(block, 'm3_scale') else 'attn_scale'
+                x = x + getattr(block, scale_name).to(dtype=x.dtype)[None, None, :] * m3_out
+                mlp_out = self.recur_mlps[str(bi)](block.mlp_norm(x))
+                x = x + block.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+            else:
+                x = self.blocks[bi](x, x0, v_embed=self._get_ve(bi, ve_cache))
             skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[0, i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[bi](x, x0, v_embed=self._get_ve(bi, ve_cache))
+
+        skip_idx = 0
+        for vi, bi in enumerate(decoder_schedule):
+            recur_pass_count[bi] = recur_pass_count.get(bi, 0) + 1
+            is_repeat = recur_pass_count[bi] > 1
+
+            if skip_idx < len(skips):
+                x = x + self.skip_weights[0, min(skip_idx, self.num_skip_weights - 1)].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                skip_idx += 1
+
+            if is_repeat and self.recur_mode == "untie_mlp" and str(bi) in getattr(self, 'recur_mlps', {}):
+                block = self.blocks[bi]
+                mix = block.resid_mix.to(dtype=x.dtype)
+                x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+                m3_out = block.mamba3(block.m3_norm(x)) if hasattr(block, 'mamba3') else block.attn(block.attn_norm(x))
+                scale_name = 'm3_scale' if hasattr(block, 'm3_scale') else 'attn_scale'
+                x = x + getattr(block, scale_name).to(dtype=x.dtype)[None, None, :] * m3_out
+                mlp_out = self.recur_mlps[str(bi)](block.mlp_norm(x))
+                x = x + block.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+            else:
+                x = self.blocks[bi](x, x0, v_embed=self._get_ve(bi, ve_cache))
         return x
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -1542,6 +1618,14 @@ def main() -> None:
                 for m in base_model.modules():
                     if isinstance(m, CastedLinear):
                         m._qat_bits = qat_bits
+
+        # Depth recurrence: enable after recur_start_frac of training
+        if args.recur_layers_str.strip() and not base_model.recur_enabled:
+            train_frac = step / max(args.iterations, 1)
+            if train_frac >= args.recur_start_frac:
+                base_model.recur_enabled = True
+                schedule = base_model._build_layer_schedule()
+                log0(f"depth_recurrence:enabled at step {step} frac={train_frac:.2f} schedule={schedule}")
 
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
