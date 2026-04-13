@@ -214,6 +214,10 @@ def train_nemotron_smoke():
         "NUM_ATTN_LAYERS": "1",
         "ATTN_PLACEMENT": "even",
         "MAMBA3_D_STATE": "64",
+        "EVAL_STRIDE": "0",       # disable sliding eval (too slow for smoke test)
+        "TTT_ENABLED": "0",       # disable TTT
+        "USE_GPTQ": "0",          # skip GPTQ (saves ~5 min)
+        "SWEEP_MODE": "1",        # skip all post-training (quant, serialize, eval)
     }, script="train_nemotron_hybrid.py")
 
 
@@ -236,6 +240,9 @@ def train_nemotron_medium():
         "NUM_ATTN_LAYERS": "1",
         "ATTN_PLACEMENT": "even",
         "MAMBA3_D_STATE": "64",
+        "EVAL_STRIDE": "0",
+        "TTT_ENABLED": "0",
+        "SWEEP_MODE": "1",        # skip GPTQ/serialize for faster iteration
     }, script="train_nemotron_hybrid.py")
 
 
