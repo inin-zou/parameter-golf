@@ -14,7 +14,7 @@ import modal
 
 app = modal.App("parameter-golf")
 
-image = (
+base_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
         "numpy", "tqdm", "torch", "huggingface-hub", "kernels",
@@ -22,6 +22,22 @@ image = (
         "tiktoken", "sentencepiece",
     )
     .add_local_file("train_gpt.py", "/app/train_gpt.py")
+    .add_local_dir("data", "/app/data", ignore=["datasets", "tokenizers"])
+)
+
+# Hybrid image: PyTorch 2.6 devel (has gcc for triton) + pre-built mamba wheels
+_conv1d_whl = "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1%2Bcu12torch2.6cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
+_mamba_whl = "https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1%2Bcu12torch2.6cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
+hybrid_image = (
+    modal.Image.from_registry("pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel")
+    .pip_install(
+        "numpy", "tqdm", "huggingface-hub", "kernels",
+        "setuptools", "typing-extensions==4.15.0", "datasets",
+        "tiktoken", "sentencepiece",
+    )
+    .pip_install(_conv1d_whl)
+    .pip_install(_mamba_whl)
+    .add_local_file("train_gpt_hybrid.py", "/app/train_gpt_hybrid.py")
     .add_local_dir("data", "/app/data", ignore=["datasets", "tokenizers"])
 )
 
@@ -63,8 +79,8 @@ def _ensure_data(variant: str, train_shards: int):
         os.symlink(vol_tok, app_tok)
 
 
-def _run_training(gpus: int, env_overrides: dict):
-    """Run train_gpt.py with torchrun."""
+def _run_training(gpus: int, env_overrides: dict, script: str = "train_gpt.py"):
+    """Run a training script with torchrun."""
     import os
     import subprocess
 
@@ -78,7 +94,7 @@ def _run_training(gpus: int, env_overrides: dict):
 
     cmd = [
         "torchrun", "--standalone", f"--nproc_per_node={gpus}",
-        "/app/train_gpt.py",
+        f"/app/{script}",
     ]
     print(f"Running: {' '.join(cmd)}")
     print(f"Config: {env_overrides}")
@@ -90,7 +106,7 @@ def _run_training(gpus: int, env_overrides: dict):
 
 
 @app.function(
-    image=image,
+    image=base_image,
     gpu="H100",
     timeout=1800,
     volumes={"/vol": data_vol},
@@ -108,7 +124,7 @@ def train_smoke():
 
 
 @app.function(
-    image=image,
+    image=base_image,
     gpu="H100",
     timeout=3600,
     volumes={"/vol": data_vol},
@@ -126,7 +142,7 @@ def train_medium():
 
 
 @app.function(
-    image=image,
+    image=base_image,
     gpu="H100:8",
     timeout=3600,
     volumes={"/vol": data_vol},
@@ -141,6 +157,28 @@ def train_full():
     })
 
 
+@app.function(
+    image=hybrid_image,
+    gpu="H100",
+    timeout=1800,
+    volumes={"/vol": data_vol},
+)
+def train_hybrid_smoke():
+    """1xH100, 200 steps, hybrid Mamba-Transformer, ~$0.07
+    9 layers: layers 0,1,2,3,5,6,7 are Mamba, layers 4,8 are Attention
+    (~78% Mamba, ~22% Attention, inspired by Nemotron-H's ~92/8 ratio)
+    """
+    _ensure_data("sp1024", train_shards=1)
+    return _run_training(1, {
+        "RUN_ID": "modal_hybrid_smoke",
+        "ITERATIONS": "200",
+        "TRAIN_BATCH_TOKENS": "524288",
+        "VAL_LOSS_EVERY": "0",
+        "MAX_WALLCLOCK_SECONDS": "0",
+        "MAMBA_LAYERS": "0,1,2,3,5,6,7",
+    }, script="train_gpt_hybrid.py")
+
+
 @app.local_entrypoint()
 def main(mode: str = "smoke"):
     if mode == "smoke":
@@ -149,5 +187,7 @@ def main(mode: str = "smoke"):
         result = train_medium.remote()
     elif mode == "full":
         result = train_full.remote()
+    elif mode == "hybrid":
+        result = train_hybrid_smoke.remote()
     else:
-        raise ValueError(f"Unknown mode: {mode}. Use smoke/medium/full")
+        raise ValueError(f"Unknown mode: {mode}. Use smoke/medium/full/hybrid")
