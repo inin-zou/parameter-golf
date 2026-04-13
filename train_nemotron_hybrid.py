@@ -114,12 +114,14 @@ class Hyperparameters:
     mamba3_expand = int(os.environ.get("MAMBA3_EXPAND", 2))
     mamba3_headdim = int(os.environ.get("MAMBA3_HEADDIM", 64))
     mamba3_chunk_size = int(os.environ.get("MAMBA3_CHUNK_SIZE", 64))
+    mamba3_ngroups = int(os.environ.get("MAMBA3_NGROUPS", 1))  # Nemotron-H uses 8
     # Attention layers (evenly spaced among SSD layers).
     num_attn_layers = int(os.environ.get("NUM_ATTN_LAYERS", 1))
     attn_placement = os.environ.get("ATTN_PLACEMENT", "even")
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_fraction = float(os.environ.get("ROPE_FRACTION", 1.0))  # partial RoPE: 0.5 = half dims
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "0")))
     ve_dim = int(os.environ.get("VE_DIM", 64))
@@ -910,12 +912,12 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 class Mamba3Layer(nn.Module):
     """Pure Mamba-3 SISO layer. Uses the Mamba3 module directly."""
     def __init__(self, dim: int, d_state: int = 64, expand: int = 2,
-                 headdim: int = 64, chunk_size: int = 64):
+                 headdim: int = 64, chunk_size: int = 64, ngroups: int = 1):
         super().__init__()
         from mamba_ssm.modules.mamba3 import Mamba3
         self.mamba3 = Mamba3(
             d_model=dim, d_state=d_state, expand=expand,
-            headdim=headdim, is_mimo=False, chunk_size=chunk_size,
+            headdim=headdim, is_mimo=False, chunk_size=chunk_size, ngroups=ngroups,
         )
         # Replace nn.Linear with CastedLinear so QAT fake-quant and float32 master
         # weights apply to Mamba-3's projections (which have the worst outlier problem).
@@ -964,7 +966,7 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 class AttentionLayer(nn.Module):
     """Standalone causal self-attention with GQA and RoPE."""
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
-                 rope_base: float, qk_gain_init: float):
+                 rope_base: float, qk_gain_init: float, rope_fraction: float = 1.0):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -975,7 +977,8 @@ class AttentionLayer(nn.Module):
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rope_dims = max(2, int(self.head_dim * rope_fraction) // 2 * 2)
+        self.rotary = Rotary(self.rope_dims, base=rope_base)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
 
@@ -991,8 +994,16 @@ class AttentionLayer(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        if self.rope_dims < self.head_dim:
+            q_rope, q_pass = q[..., :self.rope_dims], q[..., self.rope_dims:]
+            k_rope, k_pass = k[..., :self.rope_dims], k[..., self.rope_dims:]
+            q_rope = apply_rotary_emb(q_rope, cos, sin)
+            k_rope = apply_rotary_emb(k_rope, cos, sin)
+            q = torch.cat([q_rope, q_pass], dim=-1)
+            k = torch.cat([k_rope, k_pass], dim=-1)
+        else:
+            q = apply_rotary_emb(q, cos, sin)
+            k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q, k, v, attn_mask=None, is_causal=True,
@@ -1037,6 +1048,7 @@ class Block(nn.Module):
         self, dim: int, mlp_mult: int,
         mamba3_d_state: int = 64, mamba3_expand: int = 2,
         mamba3_headdim: int = 64, mamba3_chunk_size: int = 64,
+        mamba3_ngroups: int = 1,
         layer_idx: int = 0,
     ):
         super().__init__()
@@ -1044,7 +1056,7 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.mamba3 = Mamba3Layer(
             dim, d_state=mamba3_d_state, expand=mamba3_expand,
-            headdim=mamba3_headdim, chunk_size=mamba3_chunk_size,
+            headdim=mamba3_headdim, chunk_size=mamba3_chunk_size, ngroups=mamba3_ngroups,
         )
         self.mlp = MLP(dim, mlp_mult)
         self.m3_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -1066,12 +1078,13 @@ class AttnBlock(nn.Module):
         self, dim: int, mlp_mult: int,
         num_heads: int = 8, num_kv_heads: int = 4,
         rope_base: float = 10000.0, qk_gain_init: float = 1.0,
+        rope_fraction: float = 1.0,
         layer_idx: int = 0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = AttentionLayer(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = AttentionLayer(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_fraction=rope_fraction)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -1096,8 +1109,10 @@ class GPT(nn.Module):
         use_ortho_init: bool = False,
         mamba3_d_state: int = 64, mamba3_expand: int = 2,
         mamba3_headdim: int = 64, mamba3_chunk_size: int = 64,
+        mamba3_ngroups: int = 1,
         num_attn_layers: int = 1, num_heads: int = 8, num_kv_heads: int = 4,
         rope_base: float = 10000.0, qk_gain_init: float = 1.0,
+        rope_fraction: float = 1.0,
         ve_enabled: bool = False, ve_dim: int = 64,
     ):
         super().__init__()
@@ -1150,6 +1165,7 @@ class GPT(nn.Module):
                     model_dim, mlp_mult,
                     num_heads=num_heads, num_kv_heads=num_kv_heads,
                     rope_base=rope_base, qk_gain_init=qk_gain_init,
+                    rope_fraction=rope_fraction,
                     layer_idx=i,
                 ))
             else:
@@ -1157,6 +1173,7 @@ class GPT(nn.Module):
                     model_dim, mlp_mult,
                     mamba3_d_state=mamba3_d_state, mamba3_expand=mamba3_expand,
                     mamba3_headdim=mamba3_headdim, mamba3_chunk_size=mamba3_chunk_size,
+                    mamba3_ngroups=mamba3_ngroups,
                     layer_idx=i,
                 ))
 
@@ -1337,9 +1354,11 @@ def main() -> None:
         use_ortho_init=args.use_ortho_init,
         mamba3_d_state=args.mamba3_d_state, mamba3_expand=args.mamba3_expand,
         mamba3_headdim=args.mamba3_headdim, mamba3_chunk_size=args.mamba3_chunk_size,
+        mamba3_ngroups=args.mamba3_ngroups,
         num_attn_layers=args.num_attn_layers, num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads, rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        rope_fraction=args.rope_fraction,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim,
     ).to(device).bfloat16()
     for module in base_model.modules():
