@@ -25,35 +25,30 @@ base_image = (
     .add_local_dir("data", "/app/data", ignore=["datasets", "tokenizers"])
 )
 
-# Hybrid image: pre-built mamba-ssm v2.3.1 + manually copied Mamba-3 files
-_conv1d_whl = "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1%2Bcu12torch2.6cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
-_mamba_whl = "https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1%2Bcu12torch2.6cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
+# Hybrid image: PyTorch 2.9 + Triton 3.5 (same as PR #1355 RunPod environment)
+# Pre-built wheels for mamba-ssm + causal-conv1d, then copy Mamba-3 files from mamba3-release
+_conv1d_whl = "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1%2Bcu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+_mamba_whl = "https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1%2Bcu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 hybrid_image = (
-    modal.Image.from_registry("pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel")
+    modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
     .pip_install(
-        "numpy", "tqdm", "huggingface-hub", "kernels",
+        "torch==2.9.*", "numpy", "tqdm", "huggingface-hub", "kernels",
         "setuptools", "typing-extensions==4.15.0", "datasets",
         "tiktoken", "sentencepiece", "einops",
     )
-    .pip_install(_conv1d_whl)
-    .pip_install(_mamba_whl)
+    .pip_install(_conv1d_whl, _mamba_whl)
     .run_commands(
-        # mamba3-release has Mamba-3 but setup.py doesn't package it in the wheel.
-        # Clone branch and copy mamba3 files into the installed mamba_ssm package.
+        # Copy Mamba-3 modules from mamba3-release (not in v2.3.1 wheel)
         "git clone --depth 1 --branch mamba3-release https://github.com/state-spaces/mamba.git /tmp/mamba3src",
-        # Copy ALL new/updated files from mamba3-release into the installed package
-        "PKG=$(find /opt/conda -path '*/mamba_ssm/modules' -type d | head -1)/.. && "
+        "PKG=$(python -c 'import mamba_ssm,os; print(os.path.dirname(mamba_ssm.__file__))') && "
         "cp /tmp/mamba3src/mamba_ssm/modules/mamba3.py $PKG/modules/ && "
         "cp -r /tmp/mamba3src/mamba_ssm/ops/triton/mamba3 $PKG/ops/triton/ && "
         "cp /tmp/mamba3src/mamba_ssm/ops/triton/angle_cumsum.py $PKG/ops/triton/ && "
-        # Also copy any new ops directories (cute, tilelang)
         "cp -r /tmp/mamba3src/mamba_ssm/ops/cute $PKG/ops/ 2>/dev/null || true && "
         "cp -r /tmp/mamba3src/mamba_ssm/ops/tilelang $PKG/ops/ 2>/dev/null || true && "
-        "ls $PKG/modules/mamba3.py $PKG/ops/triton/angle_cumsum.py && echo 'mamba3 files OK' && "
+        "ls $PKG/modules/mamba3.py && echo 'mamba3 files OK' && "
         "rm -rf /tmp/mamba3src",
-        # Mamba-3 Triton kernels need triton >= 3.6 (set_allocator API)
-        "pip install triton --upgrade",
     )
     .add_local_file("train_gpt_hybrid.py", "/app/train_gpt_hybrid.py")
     .add_local_file("train_nemotron_hybrid.py", "/app/train_nemotron_hybrid.py")
