@@ -52,6 +52,8 @@ hybrid_image = (
     )
     .add_local_file("train_gpt_hybrid.py", "/app/train_gpt_hybrid.py")
     .add_local_file("train_nemotron_hybrid.py", "/app/train_nemotron_hybrid.py")
+    .add_local_file("train_ternary_mamba.py", "/app/train_ternary_mamba.py")
+    .add_local_file("train_qmamba.py", "/app/train_qmamba.py")
     .add_local_dir("data", "/app/data", ignore=["datasets", "tokenizers"])
 )
 
@@ -315,6 +317,59 @@ def train_recur_deep():
     }, script="train_nemotron_hybrid.py")
 
 
+# --- Helper: best config with overrides ---
+
+def _best_config_with(**overrides):
+    """Best config (hinge recur 3,4 ×2) with overrides."""
+    base = {
+        "ITERATIONS": "2000",
+        "TRAIN_BATCH_TOKENS": "524288",
+        "VAL_LOSS_EVERY": "500",
+        "MAX_WALLCLOCK_SECONDS": "0",
+        "NUM_LAYERS": "8",
+        "NUM_ATTN_LAYERS": "1",
+        "ATTN_PLACEMENT": "even",
+        "MAMBA3_D_STATE": "64",
+        "RECUR_LAYERS": "3,4",
+        "RECUR_MODE": "block",
+        "RECUR_REPEATS": "2",
+        "RECUR_START_FRAC": "0.35",
+        "EVAL_STRIDE": "0",
+        "TTT_ENABLED": "0",
+        "SWEEP_MODE": "1",
+    }
+    base.update(overrides)
+    return base
+
+
+@app.function(image=hybrid_image, gpu="H100", timeout=3600, volumes={"/vol": data_vol})
+def train_no_rope():
+    """Remove RoPE from attention layers (Jamba showed ~0 bpb loss)"""
+    _ensure_data("sp1024", train_shards=10)
+    return _run_training(1, _best_config_with(
+        RUN_ID="no_rope", ROPE_FRACTION="0.0", ITERATIONS="1000",
+    ), script="train_nemotron_hybrid.py")
+
+
+@app.function(image=hybrid_image, gpu="H100", timeout=3600, volumes={"/vol": data_vol})
+def train_ternary():
+    """Ternary Mamba: 1.58-bit BitLinear QAT"""
+    _ensure_data("sp1024", train_shards=10)
+    return _run_training(1, _best_config_with(
+        RUN_ID="ternary", USE_TERNARY="1", ITERATIONS="1000",
+    ), script="train_ternary_mamba.py")
+
+
+@app.function(image=hybrid_image, gpu="H100", timeout=3600, volumes={"/vol": data_vol})
+def train_qmamba():
+    """Q-Mamba: DSQ with int4 SSM + int6 attention"""
+    _ensure_data("sp1024", train_shards=10)
+    return _run_training(1, _best_config_with(
+        RUN_ID="qmamba_dsq", USE_DSQ="1", SSM_QUANT_BITS="4",
+        ATTN_QUANT_BITS="6", ITERATIONS="1000",
+    ), script="train_qmamba.py")
+
+
 # --- Hinge point ablations ---
 
 @app.function(image=hybrid_image, gpu="H100", timeout=3600, volumes={"/vol": data_vol})
@@ -470,5 +525,16 @@ def main(mode: str = "smoke"):
         result = train_recur_untie.remote()
     elif mode == "recur-deep":
         result = train_recur_deep.remote()
+    elif mode == "three-way":
+        print("Launching 3 experiments: No RoPE + Ternary + Q-Mamba (1000 steps each)...")
+        h1 = train_no_rope.spawn()
+        h2 = train_ternary.spawn()
+        h3 = train_qmamba.spawn()
+        for name, handle in [("No RoPE", h1), ("Ternary Mamba", h2), ("Q-Mamba DSQ", h3)]:
+            try:
+                handle.get()
+                print(f"=== {name} DONE ===")
+            except Exception as e:
+                print(f"=== {name} FAILED: {e} ===")
     else:
-        raise ValueError(f"Unknown mode: {mode}. Use smoke/medium/full/hybrid/nemotron/nemotron-medium/test/recur-ablation/recur-block/recur-untie/recur-deep")
+        raise ValueError(f"Unknown mode. Use: smoke/medium/full/hybrid/nemotron/nemotron-medium/test/recur-ablation/hinge-ablation/three-way")
