@@ -217,21 +217,57 @@ Predict continuous embeddings instead of discrete tokens.
 - Weight-compression derivatives are ~4-5 BPW, not better than current int6
 - **Verdict**: Not suitable for this competition
 
-## Recommended Strategy
+## Recommended Strategy: Nemotron-H Architecture + Mamba-3 Kernel + PR #1355 Pipeline
 
-**Primary**: Direction B (Nemotron-H inspired hybrid Mamba-Transformer)
-- Build a 16-layer hybrid model: 14 Mamba + 2 Attention layers
-- Target ~46M params compressed to ~15MB with GPTQ int6
-- This is the highest-potential direction and fills an unclaimed niche
+Combine three sources:
+- **Nemotron-H** (architecture): alternating SSM/MLP layout, evenly distributed attention, no RoPE
+- **Mamba-3** (SSM kernel): complex-valued states, MIMO, Triton kernels
+- **PR #1355** (training pipeline): GPTQ int6, MuonEq-R, Late QAT, LZMA, torch.compile(fullgraph=False)
 
-**Supporting**: Direction A (aggressive quantization) + Direction D (eval optimization)
-- Use int6 GPTQ (proven) as baseline compression
-- Explore int4 if model is too large for 16MB
-- Add TTT and sliding window eval on top of hybrid model
+### Concrete Architecture Plan
 
-**Fallback**: Direction C (incremental SOTA improvements)
-- If hybrid approach doesn't converge, fall back to pure-transformer SOTA stack
-- Apply incremental tuning (more recurrence layers, hyperparams)
+```
+8 layers, dim=512, seq_len=4096:
+├── Layer 0: Mamba-3 + MLP
+├── Layer 1: Mamba-3 + MLP
+├── Layer 2: Mamba-3 + MLP
+├── Layer 3: Attention (GQA 8h/4kv) + MLP  ← evenly placed
+├── Layer 4: Mamba-3 + MLP
+├── Layer 5: Mamba-3 + MLP
+├── Layer 6: Mamba-3 + MLP
+├── Layer 7: Mamba-3 + MLP
+├── U-Net skip connections (encoder/decoder halves)
+├── Mamba-3: SISO, d_state=64, expand=2, headdim=64, chunk_size=64
+├── No RoPE on Mamba layers (Mamba-3 complex states encode position)
+├── RoPE only on Attention layer (partial, 16/64 dims)
+└── MLP: LeakyReLU(0.5)^2, 4x expansion
+```
+
+### Training Pipeline
+- torch.compile(fullgraph=False) — proven at 115ms/step in PR #1355
+- MuonEq-R optimizer + EMA
+- Late QAT (activate at lr_mul < 0.15)
+- Full Hessian GPTQ int6 with AR self-gen calibration data
+- LZMA compression
+- Target: ~15.8MB artifact
+
+### Key Differences from PR #1355
+1. Nemotron-H inspired layer placement (evenly spaced attention)
+2. Potential: try separated Mamba/MLP layers (Nemotron-H style) vs combined blocks
+3. Potential: try d_state=128 (Nemotron-H uses this)
+4. Potential: drop RoPE entirely (Mamba-3 complex states provide position info)
+
+### Experiment Plan
+1. First replicate PR #1355 baseline (1.1526 bpb) on 8xH100
+2. Then ablate Nemotron-H inspired changes one at a time
+3. Submit best result as non-record submission
+
+### Reference PRs
+- PR #1355: Best SSM (1.1526 bpb) — https://github.com/openai/parameter-golf/pull/1355
+- PR #852: Best Hymba (1.1189 bpb) — https://github.com/openai/parameter-golf/pull/852
+- PR #1013: S4D-Lin (torch.compile fix) — https://github.com/openai/parameter-golf/pull/1013
+
+**Fallback**: If hybrid doesn't work, fall back to incremental SOTA improvements (Direction C)
 
 ## Infrastructure
 
