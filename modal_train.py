@@ -361,12 +361,32 @@ def train_ternary():
 
 
 @app.function(image=hybrid_image, gpu="H100", timeout=3600, volumes={"/vol": data_vol})
-def train_qmamba():
-    """Q-Mamba: DSQ with int4 SSM + int6 attention"""
+def train_qm_a():
+    """QM-A: A matrix FP16 only (simplest DSQ)"""
     _ensure_data("sp1024", train_shards=10)
     return _run_training(1, _best_config_with(
-        RUN_ID="qmamba_dsq", USE_DSQ="1", SSM_QUANT_BITS="4",
-        ATTN_QUANT_BITS="6", ITERATIONS="1000",
+        RUN_ID="qm_a_protect", USE_DSQ="1", ITERATIONS="1000",
+        SWEEP_MODE="0",  # need full GPTQ pipeline
+    ), script="train_qmamba.py")
+
+
+@app.function(image=hybrid_image, gpu="H100", timeout=3600, volumes={"/vol": data_vol})
+def train_qm_b():
+    """QM-B: A=FP16 + mixed precision (in/out=int6, conv1d/dt=int4, MLP=int5)"""
+    _ensure_data("sp1024", train_shards=10)
+    return _run_training(1, _best_config_with(
+        RUN_ID="qm_b_mixed", USE_DSQ="2", ITERATIONS="1000",
+        SWEEP_MODE="0",
+    ), script="train_qmamba.py")
+
+
+@app.function(image=hybrid_image, gpu="H100", timeout=3600, volumes={"/vol": data_vol})
+def train_qm_c():
+    """QM-C: Full DSQ (mode 2 + per-group scales)"""
+    _ensure_data("sp1024", train_shards=10)
+    return _run_training(1, _best_config_with(
+        RUN_ID="qm_c_full", USE_DSQ="3", DSQ_GROUP_SIZE="64", ITERATIONS="1000",
+        SWEEP_MODE="0",
     ), script="train_qmamba.py")
 
 
@@ -529,8 +549,19 @@ def main(mode: str = "smoke"):
         print("Launching 3 experiments: No RoPE + Ternary + Q-Mamba (1000 steps each)...")
         h1 = train_no_rope.spawn()
         h2 = train_ternary.spawn()
-        h3 = train_qmamba.spawn()
-        for name, handle in [("No RoPE", h1), ("Ternary Mamba", h2), ("Q-Mamba DSQ", h3)]:
+        h3 = train_qm_a.spawn()
+        for name, handle in [("No RoPE", h1), ("Ternary Mamba", h2), ("QM-A protect", h3)]:
+            try:
+                handle.get()
+                print(f"=== {name} DONE ===")
+            except Exception as e:
+                print(f"=== {name} FAILED: {e} ===")
+    elif mode == "qmamba-ablation":
+        print("Launching 3 Q-Mamba ablations (1000 steps, full GPTQ pipeline)...")
+        h1 = train_qm_a.spawn()
+        h2 = train_qm_b.spawn()
+        h3 = train_qm_c.spawn()
+        for name, handle in [("QM-A: A-protect", h1), ("QM-B: mixed-precision", h2), ("QM-C: full DSQ", h3)]:
             try:
                 handle.get()
                 print(f"=== {name} DONE ===")

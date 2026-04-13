@@ -130,7 +130,7 @@ class Hyperparameters:
     rope_fraction = float(os.environ.get("ROPE_FRACTION", 1.0))  # partial RoPE: 0.5 = half dims
 
     # DSQ (Decoupled Scale Quantization) — Mamba-aware quantization
-    use_dsq = bool(int(os.environ.get("USE_DSQ", "0")))  # 1 = Mamba-aware DSQ quantization
+    use_dsq = int(os.environ.get("USE_DSQ", "0"))  # 0=off, 1=A-protect, 2=mixed-precision, 3=full DSQ
     ssm_quant_bits = int(os.environ.get("SSM_QUANT_BITS", 4))  # lower bits for SSM layers
     attn_quant_bits = int(os.environ.get("ATTN_QUANT_BITS", 6))  # higher bits for attention
     dsq_group_size = int(os.environ.get("DSQ_GROUP_SIZE", 64))  # channel group size for SSM
@@ -591,16 +591,40 @@ def collect_hessians_from_tokens(
 
 
 def get_layer_quant_bits(name: str, args) -> int:
-    """Return quantization bits based on layer type (DSQ: lower for SSM, higher for attention)."""
-    if not args.use_dsq:
+    """Return quantization bits based on layer type and DSQ mode.
+
+    DSQ modes (USE_DSQ env var):
+    - 0: disabled, all layers use quant_bits (default 6)
+    - 1: A-protect — A matrix stays FP16, everything else int6
+    - 2: mixed-precision — A=FP16, in/out_proj=int6, conv1d/dt=int4, MLP=int6
+    - 3: full DSQ — mode 2 + per-group scales for B/C (group_size from DSQ_GROUP_SIZE)
+    """
+    mode = int(args.use_dsq) if hasattr(args, 'use_dsq') else 0
+    if mode == 0:
         return args.quant_bits
-    # SSM layers (mamba3, in_proj, out_proj of Mamba blocks)
-    if any(pat in name for pat in ['mamba3', 'm3_', 'ssm']):
-        return args.ssm_quant_bits
-    # Attention layers
-    if any(pat in name for pat in ['attn', 'c_q', 'c_k', 'c_v']):
-        return args.attn_quant_bits
-    # MLP and others: use default
+
+    # All DSQ modes: protect A matrix (keep FP16 → return 16 to signal "skip quant")
+    if any(pat in name for pat in ['A_log', 'dt_bias', 'D']):
+        return 16  # will be kept in FP16
+
+    if mode == 1:
+        # Mode 1: only protect A, rest uses default bits
+        return args.quant_bits
+
+    # Mode 2 and 3: mixed precision by component
+    # in_proj and out_proj: keep at int6 (high sensitivity)
+    if any(pat in name for pat in ['in_proj', 'out_proj']):
+        return 6
+    # conv1d and dt_proj: can go to int4 (low sensitivity)
+    if any(pat in name for pat in ['conv1d', 'dt_proj']):
+        return 4
+    # Attention layers: int6
+    if any(pat in name for pat in ['c_q', 'c_k', 'c_v', 'attn']):
+        return 6
+    # MLP: int5 (medium sensitivity, saves space)
+    if any(pat in name for pat in ['.fc', '.proj']) and 'mlp' in name:
+        return 5
+    # Default
     return args.quant_bits
 
 
@@ -1800,6 +1824,9 @@ def main() -> None:
                 # fp16_mask rows stay at original BF16 — quantize_state_dict_int8 will
                 # store them in FP16 passthrough (not INT6 quantized)
                 gptq_sd[name] = out
+            elif layer_bits >= 16:
+                # DSQ: keep this tensor in FP16 (e.g. A matrix)
+                gptq_sd[name] = t_cpu
             elif H is not None and t_cpu.is_floating_point() and t_cpu.ndim == 2 and t_cpu.numel() > INT8_KEEP_FLOAT_MAX_NUMEL:
                 q, s = quantize_int6_gptq(t_cpu, hessian=H, clip_range=(1 << (layer_bits - 1)) - 1)
                 gptq_sd[name] = (q.float() * s.float()[:, None]).to(t_cpu.dtype)
