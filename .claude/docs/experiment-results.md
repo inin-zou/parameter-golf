@@ -68,10 +68,53 @@ RECUR_LAYERS=3,4 RECUR_REPEATS=2 RECUR_MODE=block RECUR_START_FRAC=0.35
 NUM_LAYERS=8 NUM_ATTN_LAYERS=1 ATTN_PLACEMENT=even MAMBA3_D_STATE=64
 ```
 
+## Unexplored Directions on Mamba (PR survey 2026-04-13)
+
+All three directions below have been done on Transformers but NEVER on Mamba/SSM in this competition.
+
+### 1. Ternary Mamba (highest potential)
+
+Ternary Transformers already achieve strong results:
+- PR #923: 74M Ternary U-Net Transformer → **1.1090 bpb** (100k steps/3h, non-record)
+- PR #920: 74M Ternary U-Net Transformer → **1.1539 bpb** (record)
+- PR #666: BitNet 65M ternary → 1.1932 bpb
+- PR #367: BitNet b1.58 → 1.1770 bpb (systematic analysis)
+- PR #1273: Annealed Muon 1.58-bit → 1.2196 bpb
+
+Key insight: ternary (1.58-bit) lets you fit **74M params in 16MB** vs our current 26M.
+A Ternary Mamba could combine SSM parameter efficiency with extreme quantization.
+**Nobody has tried this.**
+
+### 2. Remove/Reduce RoPE on Mamba Hybrid
+
+Partial RoPE (16/64 dims) is standard on Transformer SOTA (PR #332, #458, #827).
+But Mamba-3's complex-valued states natively encode position — RoPE may be redundant.
+- ROPE_FRACTION=0: fully remove RoPE on attention layers
+- ROPE_FRACTION=0.25: keep only 1/4 dims
+- Saves parameters and computation in attention layers.
+**Nobody has tried removing RoPE on a Mamba hybrid.**
+
+### 3. Q-Mamba / Mamba-Aware Quantization (DSQ)
+
+All Mamba submissions use generic GPTQ. Research shows Mamba has unique quantization challenges:
+- SSM states have "outlier states" (large values from outer products)
+- GPTQ int5 degrades SSM weights more than attention weights (PR #1013 finding)
+- Q-Mamba paper proposes DSQ (Decoupled Scale Quantization) for SSM-specific outlier handling
+**Nobody has applied Mamba-specific quantization methods in this competition.**
+
 ## Next Experiments TODO
 
-- [ ] Run best config (Hinge 3) for full 8xH100 10-min to get real submission bpb
-- [ ] Add GPTQ int6 + LZMA to check compressed size and post-quant bpb
-- [ ] Nemotron-H ablations: d_state=128, ngroups=8, rope_fraction=0
-- [ ] Try recur 3,4 ×3 (even more focused repetition)
-- [ ] Combine with SOTA techniques: SP8192, EMA, Late QAT
+### High priority
+- [ ] Run best config (Hinge 3) for 5000+ steps to see convergence
+- [ ] ROPE_FRACTION ablation: 0, 0.25, 0.5, 1.0 (fast, just env vars)
+- [ ] Disable SWEEP_MODE to get real post-quant bpb with GPTQ int6
+
+### Medium priority
+- [ ] SP8192 tokenizer (biggest single improvement in SOTA history)
+- [ ] Combine with EMA, Late QAT, SmearGate, BigramHash
+- [ ] d_state=128, ngroups=8 ablation
+
+### Stretch goals
+- [ ] Ternary Mamba (1.58-bit, 74M params in 16MB)
+- [ ] Q-Mamba DSQ quantization
+- [ ] TransMamba-style shared weights at hinge point
