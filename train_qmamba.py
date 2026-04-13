@@ -885,12 +885,13 @@ class FakeQuantizeSTE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, w: Tensor, bits: int) -> Tensor:
         qmax = (1 << (bits - 1)) - 1
+        min_scale = 1e-5
         if w.ndim == 2:
             scale = w.detach().abs().amax(dim=1, keepdim=True) / qmax
-            scale = scale.clamp_min(1.0 / qmax)
+            scale = scale.clamp_min(min_scale)
             return (torch.clamp(torch.round(w / scale), -qmax, qmax) * scale).to(w.dtype)
         scale = w.detach().abs().amax() / qmax
-        scale = scale.clamp_min(1.0 / qmax)
+        scale = scale.clamp_min(min_scale)
         return (torch.clamp(torch.round(w / scale), -qmax, qmax) * scale).to(w.dtype)
 
     @staticmethod
@@ -1633,7 +1634,7 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
 
-        if args.qat_start_frac > 0 and max_wallclock_ms:
+        if args.qat_start_frac > 0 and max_wallclock_ms and not args.sweep_mode:
             elapsed_frac_qat = elapsed_ms / max_wallclock_ms
             qat_active = elapsed_frac_qat >= args.qat_start_frac
             qat_bits = args.quant_bits if qat_active else 0
@@ -1644,7 +1645,7 @@ def main() -> None:
                         m._qat_bits = get_layer_quant_bits(name, args) if args.use_dsq else qat_bits
 
         # Late QAT: trigger when lr_mul drops below threshold (SOTA approach)
-        if args.late_qat_threshold > 0 and scale < args.late_qat_threshold:
+        if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not args.sweep_mode:
             if any(m._qat_bits == 0 for m in base_model.modules() if isinstance(m, CastedLinear)):
                 qat_bits = args.quant_bits
                 log0(f"late_qat:enabled bits={qat_bits} at step {step} scale={scale:.4f}")
