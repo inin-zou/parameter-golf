@@ -94,15 +94,17 @@ def _ensure_data(variant: str, train_shards: int):
 
 
 def _run_training(gpus: int, env_overrides: dict, script: str = "train_gpt.py"):
-    """Run a training script with torchrun."""
+    """Run a training script with torchrun. Streams output in real-time."""
     import os
     import subprocess
+    import sys
 
     env = {**os.environ}
     env.update({
         "DATA_PATH": "/app/data/datasets/fineweb10B_sp1024/",
         "TOKENIZER_PATH": "/app/data/tokenizers/fineweb_1024_bpe.model",
         "VOCAB_SIZE": "1024",
+        "PYTHONUNBUFFERED": "1",  # force unbuffered output
     })
     env.update(env_overrides)
 
@@ -111,12 +113,12 @@ def _run_training(gpus: int, env_overrides: dict, script: str = "train_gpt.py"):
         f"/app/{script}",
     ]
     print(f"Running: {' '.join(cmd)}")
-    print(f"Config: {env_overrides}")
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    print(result.stdout[-5000:] if len(result.stdout) > 5000 else result.stdout)
+    print(f"Config: {env_overrides}", flush=True)
+    # Stream stdout/stderr in real-time instead of buffering
+    result = subprocess.run(cmd, env=env, stdout=sys.stdout, stderr=sys.stderr)
     if result.returncode != 0:
-        print("STDERR (last 3000 chars):", result.stderr[-3000:])
-    return result.stdout
+        print(f"Training failed with exit code {result.returncode}")
+    return f"exit_code={result.returncode}"
 
 
 @app.function(
@@ -196,7 +198,7 @@ def train_hybrid_smoke():
 @app.function(
     image=hybrid_image,
     gpu="H100",
-    timeout=1800,
+    timeout=3600,
     volumes={"/vol": data_vol},
 )
 def train_nemotron_smoke():
