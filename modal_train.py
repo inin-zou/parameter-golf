@@ -25,18 +25,36 @@ base_image = (
     .add_local_dir("data", "/app/data", ignore=["datasets", "tokenizers"])
 )
 
-# Hybrid image: PyTorch 2.6 devel (has gcc for triton) + pre-built mamba wheels
+# Hybrid image: pre-built mamba-ssm v2.3.1 + manually copied Mamba-3 files
 _conv1d_whl = "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1%2Bcu12torch2.6cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
 _mamba_whl = "https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1%2Bcu12torch2.6cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
 hybrid_image = (
     modal.Image.from_registry("pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel")
+    .apt_install("git")
     .pip_install(
         "numpy", "tqdm", "huggingface-hub", "kernels",
         "setuptools", "typing-extensions==4.15.0", "datasets",
-        "tiktoken", "sentencepiece",
+        "tiktoken", "sentencepiece", "einops",
     )
     .pip_install(_conv1d_whl)
     .pip_install(_mamba_whl)
+    .run_commands(
+        # mamba3-release has Mamba-3 but setup.py doesn't package it in the wheel.
+        # Clone branch and copy mamba3 files into the installed mamba_ssm package.
+        "git clone --depth 1 --branch mamba3-release https://github.com/state-spaces/mamba.git /tmp/mamba3src",
+        # Copy ALL new/updated files from mamba3-release into the installed package
+        "PKG=$(find /opt/conda -path '*/mamba_ssm/modules' -type d | head -1)/.. && "
+        "cp /tmp/mamba3src/mamba_ssm/modules/mamba3.py $PKG/modules/ && "
+        "cp -r /tmp/mamba3src/mamba_ssm/ops/triton/mamba3 $PKG/ops/triton/ && "
+        "cp /tmp/mamba3src/mamba_ssm/ops/triton/angle_cumsum.py $PKG/ops/triton/ && "
+        # Also copy any new ops directories (cute, tilelang)
+        "cp -r /tmp/mamba3src/mamba_ssm/ops/cute $PKG/ops/ 2>/dev/null || true && "
+        "cp -r /tmp/mamba3src/mamba_ssm/ops/tilelang $PKG/ops/ 2>/dev/null || true && "
+        "ls $PKG/modules/mamba3.py $PKG/ops/triton/angle_cumsum.py && echo 'mamba3 files OK' && "
+        "rm -rf /tmp/mamba3src",
+        # Mamba-3 Triton kernels need triton >= 3.6 (set_allocator API)
+        "pip install triton --upgrade",
+    )
     .add_local_file("train_gpt_hybrid.py", "/app/train_gpt_hybrid.py")
     .add_local_file("train_nemotron_hybrid.py", "/app/train_nemotron_hybrid.py")
     .add_local_dir("data", "/app/data", ignore=["datasets", "tokenizers"])
@@ -224,6 +242,42 @@ def train_nemotron_medium():
     }, script="train_nemotron_hybrid.py")
 
 
+@app.function(
+    image=hybrid_image,
+    gpu="H100",  # need H100 for Triton kernels (sm_90)
+    timeout=120,
+)
+def test_mamba3_import():
+    """Quick import test — validates the image has Mamba-3 modules."""
+    import os
+    import torch
+    print(f"torch: {torch.__version__}, CUDA: {torch.cuda.is_available()}, GPU: {torch.cuda.get_device_name()}")
+
+    # Test 1: mamba_ssm base + list files
+    import mamba_ssm
+    mod_dir = os.path.dirname(mamba_ssm.__file__)
+    modules = os.listdir(os.path.join(mod_dir, "modules"))
+    print(f"mamba_ssm: {mamba_ssm.__version__}")
+    print(f"modules/: {sorted(modules)}")
+    has_mamba3 = "mamba3.py" in modules
+    print(f"mamba3.py present: {has_mamba3}")
+
+    if has_mamba3:
+        triton_contents = os.listdir(os.path.join(mod_dir, "ops", "triton"))
+        print(f"ops/triton/: {sorted(triton_contents)}")
+
+        # Test 2: Mamba3 import and forward pass
+        from mamba_ssm.modules.mamba3 import Mamba3
+        m3 = Mamba3(d_model=64, d_state=16, headdim=16, is_mimo=False, chunk_size=16).cuda().bfloat16()
+        x = torch.randn(1, 32, 64, device="cuda", dtype=torch.bfloat16)
+        y3 = m3(x)
+        print(f"Mamba3 forward OK: {x.shape} -> {y3.shape}")
+    else:
+        print("FAIL: mamba3.py not found!")
+
+    return "ALL TESTS PASSED" if has_mamba3 else "FAIL: mamba3 not installed"
+
+
 @app.local_entrypoint()
 def main(mode: str = "smoke"):
     if mode == "smoke":
@@ -238,5 +292,8 @@ def main(mode: str = "smoke"):
         result = train_nemotron_smoke.remote()
     elif mode == "nemotron-medium":
         result = train_nemotron_medium.remote()
+    elif mode == "test":
+        result = test_mamba3_import.remote()
+        print(result)
     else:
-        raise ValueError(f"Unknown mode: {mode}. Use smoke/medium/full/hybrid/nemotron/nemotron-medium")
+        raise ValueError(f"Unknown mode: {mode}. Use smoke/medium/full/hybrid/nemotron/nemotron-medium/test")
