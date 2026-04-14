@@ -37,6 +37,9 @@ Based on PR #1355 (best SSM submission, 1.1526 bpb).
 | Baseline full (8xH100, 13780 steps) | 13780 | 1.224 | 43 | 8xH100 |
 
 Best config so far: `RECUR_LAYERS=3,4 RECUR_REPEATS=2` (hinge point ×2 recurrence)
+Post-quant (1000 steps, standard GPTQ): **1.4765 bpb**, 8.2MB
+
+Ruled out: Ternary (too small), Q-Mamba DSQ (standard GPTQ better), No RoPE (hurts at small scale)
 
 2000-step result (1.292) is within 0.067 of baseline with only 1/7 the steps. Still improving.
 

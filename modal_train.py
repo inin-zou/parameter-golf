@@ -343,6 +343,15 @@ def _best_config_with(**overrides):
 
 
 @app.function(image=hybrid_image, gpu="H100", timeout=3600, volumes={"/vol": data_vol})
+def train_baseline_gptq():
+    """Best config + standard GPTQ (no DSQ). The control experiment."""
+    _ensure_data("sp1024", train_shards=10)
+    return _run_training(1, _best_config_with(
+        RUN_ID="baseline_gptq", ITERATIONS="1000", SWEEP_MODE="0",
+    ), script="train_nemotron_hybrid.py")
+
+
+@app.function(image=hybrid_image, gpu="H100", timeout=3600, volumes={"/vol": data_vol})
 def train_no_rope():
     """Remove RoPE from attention layers (Jamba showed ~0 bpb loss)"""
     _ensure_data("sp1024", train_shards=10)
@@ -556,6 +565,8 @@ def main(mode: str = "smoke"):
                 print(f"=== {name} DONE ===")
             except Exception as e:
                 print(f"=== {name} FAILED: {e} ===")
+    elif mode == "baseline-gptq":
+        result = train_baseline_gptq.remote()
     elif mode == "qmamba-ablation":
         print("Launching 3 Q-Mamba ablations (1000 steps, full GPTQ pipeline)...")
         h1 = train_qm_a.spawn()

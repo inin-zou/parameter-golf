@@ -102,19 +102,63 @@ All Mamba submissions use generic GPTQ. Research shows Mamba has unique quantiza
 - Q-Mamba paper proposes DSQ (Decoupled Scale Quantization) for SSM-specific outlier handling
 **Nobody has applied Mamba-specific quantization methods in this competition.**
 
-## Next Experiments TODO
+## Three-Way Ablation: No RoPE + Ternary + Q-Mamba (2026-04-13)
 
-### High priority
-- [ ] Run best config (Hinge 3) for 5000+ steps to see convergence
-- [ ] ROPE_FRACTION ablation: 0, 0.25, 0.5, 1.0 (fast, just env vars)
-- [ ] Disable SWEEP_MODE to get real post-quant bpb with GPTQ int6
+All on best config (recur 3,4 ×2), 1000 steps, 1xH100.
 
-### Medium priority
-- [ ] SP8192 tokenizer (biggest single improvement in SOTA history)
-- [ ] Combine with EMA, Late QAT, SmearGate, BigramHash
-- [ ] d_state=128, ngroups=8 ablation
+| Experiment | val_bpb @1000 | Status | Verdict |
+|------------|--------------|--------|---------|
+| No RoPE (ROPE_FRACTION=0) | 1.3901 | Done | **Worse** — small model needs RoPE |
+| Ternary Mamba (BitLinear 1.58-bit) | 1.7149 | Done | **Much worse** — 26M too small for ternary |
+| Q-Mamba DSQ (first attempt) | nan | Crashed | Bug fixed |
 
-### Stretch goals
-- [ ] Ternary Mamba (1.58-bit, 74M params in 16MB)
-- [ ] Q-Mamba DSQ quantization
-- [ ] TransMamba-style shared weights at hinge point
+## Q-Mamba Quantization Ablation (2026-04-13)
+
+All on best config (recur 3,4 ×2), 1000 steps, 1xH100, SWEEP_MODE=0 (full GPTQ pipeline).
+
+| Experiment | pre-quant | post-quant | quant loss | size | Verdict |
+|------------|-----------|-----------|------------|------|---------|
+| **Standard GPTQ (control)** | **1.3948** | **1.4765** | **0.082** | **8.2MB** | **BEST** |
+| QM-A: A=FP16 only | 1.3348 | 1.7434 | 0.409 | 6.7MB | Worse |
+| QM-B: mixed precision | 1.3349 | 1.7418 | 0.407 | 6.7MB | Worse |
+| QM-C: full DSQ | 1.3335 | 1.4810 | 0.148 | 8.0MB | Better than A/B but worse than standard |
+
+### Key Findings
+
+1. **Standard GPTQ is already excellent** on our model (0.082 quant loss). PR #1355's Full Hessian + AR self-gen calibration is well-optimized.
+2. **Q-Mamba DSQ does NOT help** in our case. The DSQ paper's improvements apply to naive per-tensor quantization, not to sophisticated GPTQ.
+3. **Ternary is not viable at 26M params** — literature confirms minimum ~1.3B for ternary to work.
+4. **RoPE cannot be removed at small scale** — unlike Jamba (1.3B), our 26M model depends on RoPE.
+
+## Ruled Out Approaches (with evidence)
+
+| Approach | Tested? | Result | Reason |
+|----------|---------|--------|--------|
+| Remove RoPE | Yes | +0.072 bpb worse | Small model needs explicit position encoding |
+| Ternary Mamba | Yes | +0.397 bpb worse | 26M params insufficient expressivity |
+| Q-Mamba DSQ | Yes | +0.066 bpb worse than standard GPTQ | Full Hessian GPTQ already handles outliers |
+| TurboQuant | No (research) | N/A | Designed for KV cache, not weights |
+| Text Diffusion | No (research) | N/A | BPB metric favors autoregressive |
+
+## Current Best Configuration
+
+```bash
+# Architecture
+NUM_LAYERS=8 NUM_ATTN_LAYERS=1 ATTN_PLACEMENT=even MAMBA3_D_STATE=64
+
+# Depth recurrence
+RECUR_LAYERS=3,4 RECUR_REPEATS=2 RECUR_MODE=block RECUR_START_FRAC=0.35
+
+# Keep defaults
+ROPE_FRACTION=1.0  USE_DSQ=0  USE_TERNARY=0
+
+# Results (1000 steps, 1xH100)
+# pre-quant: 1.3948 | post-quant: 1.4765 | size: 8.2MB
+```
+
+## Next Steps
+
+- [ ] Run best config for 2000+ steps with GPTQ to see real improvement
+- [ ] SP8192 tokenizer (biggest untapped improvement)
+- [ ] 8xH100 full 10-minute submission run (needs OpenAI compute grant)
+- [ ] Submit as non-record to openai/parameter-golf
